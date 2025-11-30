@@ -25,11 +25,15 @@ require 'strscan'
 require 'unicode/display_width'
 require 'yaml'
 require 'zlib'
+require 'rbconfig'
+require 'tmpdir'
 
-SOFT_LIMIT            = 0.100
-HARD_LIMIT            = 0.200
-HARD_LIMIT_FIRST_TICK = 20.0
+SOFT_LIMIT            = 9990.100
+HARD_LIMIT            = 9990.200
+HARD_LIMIT_FIRST_TICK = 99920.0
+HARD_LIMIT_FIRST_TICK_CHECK_DETERMINISM = 60.0
 OVERTIME_BUDGET       = 1.5
+THREADS = 15
 
 ANSI = /\e\[[0-9;:<>?]*[@-~]/
 
@@ -250,7 +254,7 @@ class Runner
 
     Bot = Struct.new(:stdin, :stdout, :stderr, :wait_thr)
 
-    attr_accessor :round, :stage_title, :stage_key, :timeout_scale
+    attr_accessor :round, :stage_title, :stage_key
     attr_reader :bots, :rng
 
     def initialize(seed:, width:, height:, generator:, max_ticks:,
@@ -261,7 +265,7 @@ class Runner
                    docker_workdirs:, rounds:, round_seeds:, verbose:,
                    max_tps:, announcer_enabled:, ansi_log_path:,
                    show_timings:, start_paused:, highlight_color:,
-                   enable_debug:, timeout_scale:
+                   enable_debug:
                    )
         @seed = seed
         @width = width
@@ -301,7 +305,6 @@ class Runner
         @start_paused = start_paused
         @highlight_color = highlight_color
         @enable_debug = enable_debug
-        @timeout_scale = timeout_scale
         @faded_highlight_color = mix_rgb_hex(@highlight_color, '#000000', 0.25)
         @demo_mode = @ansi_log_path && File.basename(@ansi_log_path).include?('demo')
 
@@ -412,17 +415,17 @@ class Runner
                 #         end
                 #     end
                 # else
-                    (0...@height).each do |y|
-                        (0...@width).each do |x|
-                            offset = (y << 16) | x
+                (0...@height).each do |y|
+                    (0...@width).each do |x|
+                        offset = (y << 16) | x
                             v = Set.new()
-                            unless @maze.include?(offset)
-                                visible = FOVAngle.visible(@width, @height, @maze, x, y, radius: @vis_radius) { |xx, yy| @maze.include?((yy << 16) | xx) }
-                                v = visible.to_a.map { |p| (p[1] << 16) | p[0] }.sort
-                            end
-                            @visibility[offset] = Set.new(v)
+                        unless @maze.include?(offset)
+                            visible = FOVAngle.visible(@width, @height, @maze, x, y, radius: @vis_radius) { |xx, yy| @maze.include?((yy << 16) | xx) }
+                            v = visible.to_a.map { |p| (p[1] << 16) | p[0] }.sort
                         end
+                        @visibility[offset] = Set.new(v)
                     end
+                end
                 # end
 
                 if @cache
@@ -1202,7 +1205,7 @@ class Runner
                                 data[:config] = {}
                                 %w(stage_key width height generator max_ticks emit_signals vis_radius max_gems
                                     gem_spawn_rate gem_ttl signal_radius signal_cutoff signal_noise
-                                    signal_quantization signal_fade enable_debug timeout_scale).each do |key|
+                                    signal_quantization signal_fade enable_debug).each do |key|
                                     data[:config][key.to_sym] = instance_variable_get("@#{key}")
                                 end
                                 bot_seed = Digest::SHA256.digest("#{@seed}/bot").unpack1('L<')
@@ -1257,7 +1260,7 @@ class Runner
                     # 3b) WRITE PHASE: send to all eligible bots first
                     start_mono   = {}
                     deadline_mono = {}
-                    write_limit = (@tick == 0 ? HARD_LIMIT_FIRST_TICK : HARD_LIMIT) * @timeout_scale
+                    write_limit = (@tick == 0 ? (@check_determinism ? HARD_LIMIT_FIRST_TICK_CHECK_DETERMINISM : HARD_LIMIT_FIRST_TICK) : HARD_LIMIT)
                     (0...@bots.size).each do |_k|
                         i = (_k + bot_with_initiative) % @bots.size
                         next if @bots[i][:disqualified_for] || prepared[i].nil?
@@ -1360,12 +1363,12 @@ class Runner
 
                         elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - start_mono[i]
                         @bots[i][:response_times] << elapsed
-                        overtime = (@tick == 0 || @check_determinism) ? 0.0 : (elapsed - SOFT_LIMIT * @timeout_scale)
+                        overtime = (@tick == 0 || @check_determinism) ? 0.0 : (elapsed - SOFT_LIMIT)
                         @bots[i][:overtime_used] += overtime if overtime > 0.0
                         if @announcer_enabled && overtime.to_f > 0.0
                             @chatlog << {emoji: ANNOUNCER_EMOJI, text: "#{@bots[i][:name]} exceeded soft limit by #{(overtime * 1e3).to_i} ms (total overtime: #{(@bots[i][:overtime_used] * 1e3).to_i} ms)" }
                         end
-                        if @bots[i][:overtime_used] > OVERTIME_BUDGET * @timeout_scale
+                        if @bots[i][:overtime_used] > OVERTIME_BUDGET
                             if @bots[i][:disqualified_for].nil?
                                 @bots[i][:disqualified_for] = 'overtime_budget_exceeded'
                                 @chatlog << {emoji: ANNOUNCER_EMOJI, text: "#{@bots[i][:name]} has exceeded their overtime budget and is disqualified!" } if @announcer_enabled
@@ -1375,9 +1378,7 @@ class Runner
                         command = (line.split(' ').first || '').strip
                         debug_json = line[command.length..-1]&.strip
                         @protocol[i].last[:bots][:response] = command
-                        unless @check_determinism
-                            @protocol[i].last[:bots][:debug_json] = debug_json
-                        end
+                        @protocol[i].last[:bots][:debug_json] = debug_json
 
                         bot_position = @bots[i][:position]
                         if ['N','E','S','W'].include?(command)
@@ -1406,34 +1407,34 @@ class Runner
 
                     # STEP 4: COLLECT GEMS & DECAY GEMS
                     if @tick < @max_ticks
-                        collected_gems = []
-                        @gems.each.with_index do |gem, i|
-                            collected_this_gem = false
-                            (0...@bots.size).each do |_k|
-                                k = (_k + bot_with_initiative) % @bots.size
-                                bot = @bots[k]
-                                next if bot[:disqualified_for]
-                                if bot[:position] == gem[:position]
-                                    collected_this_gem = true
-                                    collected_gems << i
-                                    bot[:score] += gem[:ttl]
-                                    results[k][:ticks_to_first_capture] ||= @tick
-                                    if @announcer_enabled
-                                        @chatlog << {emoji: ANNOUNCER_EMOJI, text: "#{bot[:name]} scored a gem with #{gem[:ttl]} points!" }
-                                    end
+                    collected_gems = []
+                    @gems.each.with_index do |gem, i|
+                        collected_this_gem = false
+                        (0...@bots.size).each do |_k|
+                            k = (_k + bot_with_initiative) % @bots.size
+                            bot = @bots[k]
+                            next if bot[:disqualified_for]
+                            if bot[:position] == gem[:position]
+                                collected_this_gem = true
+                                collected_gems << i
+                                bot[:score] += gem[:ttl]
+                                results[k][:ticks_to_first_capture] ||= @tick
+                                if @announcer_enabled
+                                    @chatlog << {emoji: ANNOUNCER_EMOJI, text: "#{bot[:name]} scored a gem with #{gem[:ttl]} points!" }
                                 end
-                                break if collected_this_gem
                             end
+                            break if collected_this_gem
                         end
-                        collected_gems.reverse.each do |i|
-                            @gems.delete_at(i)
-                        end
-                        @gems.each.with_index do |gem, i|
-                            gem[:ttl] -= 1
-                        end
-                        @gems.reject! do |gem|
-                            gem[:ttl] <= 0
-                        end
+                    end
+                    collected_gems.reverse.each do |i|
+                        @gems.delete_at(i)
+                    end
+                    @gems.each.with_index do |gem, i|
+                        gem[:ttl] -= 1
+                    end
+                    @gems.reject! do |gem|
+                        gem[:ttl] <= 0
+                    end
                     end
 
                     if @gems.size < @max_gems
@@ -1514,10 +1515,10 @@ class Runner
             remaining_response_times = bot[:response_times].map { |x| (x * 1e9).to_i }
             remaining_response_times.shift if remaining_response_times.size > 0
             results[i][:response_time_stats] = {
-                :first => first_response_time,
-                :min => (remaining_response_times.size > 0 ? remaining_response_times.min : nil),
-                :median => (remaining_response_times.size > 0 ? remaining_response_times.sort[remaining_response_times.size / 2] : nil),
-                :max => (remaining_response_times.size > 0 ? remaining_response_times.max : nil),
+                :first => first_response_time / 1000000.0,
+                :min => (remaining_response_times.size > 0 ? remaining_response_times.min : nil) / 1000000.0,
+                :median => (remaining_response_times.size > 0 ? remaining_response_times.sort[remaining_response_times.size / 2] : nil) / 1000000.0,
+                :max => (remaining_response_times.size > 0 ? remaining_response_times.max : nil) / 1000000.0,
             }
             results[i][:stderr_log] = bot[:stderr_log]
             if @profile
@@ -1583,7 +1584,6 @@ options = {
     start_paused: false,
     highlight_color: '#ffffff',
     enable_debug: true,
-    timeout_scale: 1.0,
 }
 
 unless ARGV.include?('--stage')
@@ -1730,10 +1730,6 @@ OptionParser.new do |opts|
     opts.on("--[no-]enable-debug", "Enable debugging commands from bot (default: #{options[:enable_debug]})") do |x|
         options[:enable_debug] = x
     end
-    opts.on("--timeout-scale N", Float, "Timeout scale (default: #{options[:timeout_scale]}), 0 to disable timeouts") do |x|
-        x = 3600 * 24 if x <= 1e-6
-        options[:timeout_scale] = x
-    end
 end.parse!
 
 bot_paths = ARGV.map do |x|
@@ -1767,8 +1763,6 @@ if options[:check_determinism]
             runner = Runner.new(**options)
             runner.stage_title = stage_title if stage_title
             runner.stage_key = stage_key if stage_key
-            # allow for more time for bot startup and responses during determinism check
-            runner.timeout_scale = 10.0
             runner.setup
             runner.add_bot(path)
             results = runner.run
@@ -1845,100 +1839,226 @@ if options[:rounds] == 1
         end
     end
 else
-    round_seed = Digest::SHA256.digest("#{options[:seed]}/rounds").unpack1('L<')
-    seed_rng = PCG32.new(round_seed)
-    all_score = bot_paths.map { [] }
-    all_utilization = bot_paths.map { [] }
-    all_ttfc = bot_paths.map { [] }
-    all_tc = bot_paths.map { [] }
-    all_seed = []
-    all_disqualified_for = bot_paths.map { [] }
-    all_response_time_stats = bot_paths.map { [] }
-    all_stderr_logs = bot_paths.map { [] }
+  # --- Parallel multi-round orchestrator using child processes ---
 
-    bot_data = []
+  round_seed_base = Digest::SHA256.digest("#{options[:seed]}/rounds").unpack1('L<')
+  seed_rng        = PCG32.new(round_seed_base)
 
-    options[:rounds].times do |i|
-        if options[:round_seeds]
-            options[:seed] = options[:round_seeds][i].to_i(36)
-        else
-            options[:seed] = seed_rng.randrange(2 ** 32)
-        end
-        all_seed << options[:seed]
-        runner = Runner.new(**options)
-        runner.round = i
-        runner.stage_title = stage_title if stage_title
-        runner.stage_key = stage_key if stage_key
-        runner.setup
-        bot_paths.each { |path| runner.add_bot(path) }
-        if i == 0
-            runner.bots.each.with_index do |bot, k|
-                bot_data << {:name => bot[:name], :emoji => bot[:emoji]}
+  # Precompute per-round seeds, just like runner.rb
+  all_seed = []
+  options[:rounds].times do |i|
+    round_seed_value = if options[:round_seeds]
+      options[:round_seeds][i].to_i(36)
+    else
+      seed_rng.randrange(2 ** 32)
+    end
+    all_seed << round_seed_value
+  end
+
+  bot_count = bot_paths.size
+
+  # Aggregation arrays (same semantics as runner.rb)
+  all_score              = Array.new(bot_count) { Array.new(options[:rounds]) }
+  all_utilization        = Array.new(bot_count) { Array.new(options[:rounds]) }
+  all_ttfc               = Array.new(bot_count) { Array.new(options[:rounds]) }
+  all_tc                 = Array.new(bot_count) { Array.new(options[:rounds]) }
+  all_disqualified_for   = Array.new(bot_count) { Array.new(options[:rounds]) }
+  all_response_time_stats = Array.new(bot_count) { Array.new(options[:rounds]) }
+  all_stderr_logs        = Array.new(bot_count) { Array.new(options[:rounds]) }
+
+  # Will be filled from the first successful child
+  bot_data       = Array.new(bot_count)
+  bot_data_mutex = Mutex.new
+
+  # Build child argv mirroring parent settings, but force:
+  #   - single round
+  #   - JSON profile to a per-round temp file
+  build_child_cmd = lambda do |seed, json_path|
+    # Run the single-round reference runner in each child process to avoid any
+    # differences between the orchestrator and the per-round game logic.
+    cmd = [RbConfig.ruby, File.expand_path("runner.rb", __dir__)]
+    cmd += ['--stage', stage_key] if stage_key
+    cmd += [
+      '--seed', seed.to_s(36),
+      '--generator',        options[:generator],
+      '--ticks',            options[:max_ticks].to_s,
+      '--vis-radius',       options[:vis_radius].to_s,
+      (options[:emit_signals] ? '--emit-signals' : '--no-emit-signals'),
+      '--signal-radius',        options[:signal_radius].to_s,
+      '--signal-quantization',  options[:signal_quantization].to_s,
+      '--signal-noise',         options[:signal_noise].to_s,
+      '--signal-cutoff',        options[:signal_cutoff].to_s,
+      '--signal-fade',          options[:signal_fade].to_s,
+      (options[:swap_bots] ? '--swap-bots' : '--no-swap-bots'),
+      (options[:cache] ? '--cache' : '--no-cache'),
+      (options[:use_docker] ? '--use-docker' : '--no-use-docker'),
+      (options[:announcer_enabled] ? '--announcer' : '--no-announcer'),
+      (options[:show_timings] ? '--show-timings' : '--no-show-timings'),
+      (options[:start_paused] ? '--start-paused' : '--no-start-paused'),
+      '--highlight-color',  options[:highlight_color],
+      '--write-profile-json', json_path,
+      '--profile',
+      '--rounds', '1',
+      '--verbose', '0',
+      '--max-tps', '0'
+    ]
+    cmd += bot_paths # positional bot paths last
+    cmd
+  end
+
+  # Job queue: each job is a round index
+  jobs = Queue.new
+  options[:rounds].times { |i| jobs << i }
+
+  # --- Progress reporting (to STDERR), like your previous version ---
+  progress_mutex   = Mutex.new
+  completed        = 0
+  start_time       = Time.now
+  last_print_time  = start_time
+  total_rounds     = options[:rounds]
+
+  print_progress = lambda do
+    elapsed = Time.now - start_time
+    pct     = (completed * 100.0 / total_rounds).floor
+    rate    = (elapsed > 0 && completed > 0) ? (completed / elapsed) : 0.0
+    remain  = total_rounds - completed
+    eta_s   = (rate > 0) ? (remain / rate) : nil
+    eta_str = eta_s ? "%02d:%02d" % [eta_s.to_i / 60, eta_s.to_i % 60] : "--:--"
+    line    = "Progress: #{completed}/#{total_rounds} (#{pct}%) · ETA #{eta_str}"
+    $stderr.print("\r#{line.ljust(80)}")
+    $stderr.flush
+  end
+  # ------------------------------------------------------------------
+
+  workers = Array.new(THREADS) do
+    Thread.new do
+      loop do
+        idx = (jobs.pop(true) rescue nil)
+        break unless idx
+
+        job_seed = all_seed[idx]
+
+        begin
+          Dir.mktmpdir("runner_round_#{idx}_") do |dir|
+            json_path = File.join(dir, "round.json")
+            cmd       = build_child_cmd.call(job_seed, json_path)
+
+            stdout, stderr, status = Open3.capture3(*cmd)
+
+            unless status.success? && File.exist?(json_path)
+              warn "⚠️  Round #{idx + 1}: child failed or JSON missing."
+              warn "Status: #{status.exitstatus}" unless status.success?
+              warn "STDERR:\n#{stderr}" unless stderr.empty?
+              next
             end
-        end
-        results = runner.run
-        (0...bot_paths.size).each do |k|
-            all_score[k] << results[k][:score]
-            all_utilization[k] << results[k][:gem_utilization]
-            all_ttfc[k] << results[k][:ticks_to_first_capture]
-            all_tc[k] << results[k][:tile_coverage]
-            all_disqualified_for[k] << results[k][:disqualified_for]
-            all_response_time_stats[k] << results[k][:response_time_stats]
-            all_stderr_logs[k] << results[k][:stderr_log]
-        end
-    end
-    puts
 
-    all_reports = []
-    bot_data.each.with_index do |data, i|
-        puts "Results for #{data[:emoji]} #{data[:name]}"
-        n     = all_utilization[i].size
-        mean  = all_utilization[i].sum(0.0) / n
-        var   = all_utilization[i].map { |x| (x - mean) ** 2 }.sum / n
-        sd    = Math.sqrt(var)
-        cv    = sd / mean * 100.0
-        puts sprintf("Total Score     : %5d", all_score[i].sum)
-        puts sprintf("Gem Utilization : %5.1f %%", mean)
-        if cv.nan?
-            puts sprintf("Chaos Factor    :     -")
-        else
-            puts sprintf("Chaos Factor    : %5.1f %%", cv)
-        end
-        puts sprintf("Floor Coverage  : %5.1f %%", mean(all_tc[i]))
-        report = {}
-        report[:timestamp] = Time.now.to_i
-        report[:stage_key] = stage_key
-        report[:stage_title] = stage_title
-        report[:git_hash] = `git describe --always --dirty`.strip
-        report[:seed] = og_seed.to_s(36)
-        report[:name] = data[:name]
-        report[:emoji] = data[:emoji]
-        report[:total_score] = all_score[i].sum
-        report[:gem_utilization_mean] = mean
-        report[:gem_utilization_cv] = cv.nan? ? nil : cv
-        report[:floor_coverage_mean] = mean(all_tc[i])
-        report[:rounds] = all_score[i].map.with_index do |_, k|
-            d = {
-                :seed => all_seed[k].to_s(36),
-                :score => all_score[i][k],
-                :gem_utilization => all_utilization[i][k],
-                :floor_coverage => all_tc[i][k],
-                :ticks_to_first_capture => all_ttfc[i][k],
-                :disqualified_for => all_disqualified_for[i][k],
-                :response_time_stats => all_response_time_stats[i][k],
-            }
-            if d[:disqualified_for]
-                d[:stderr_log] = all_stderr_logs[i][k]
+            # Child wrote the single-round JSON that matches runner.rb’s 1-round branch
+            data = JSON.parse(File.read(json_path)) # => array of per-bot reports
+
+            data.each_with_index do |report, k|
+              # Fill bot_data (name & emoji) once
+              if bot_data[k].nil?
+                bot_data_mutex.synchronize do
+                  if bot_data[k].nil?
+                    bot_data[k] = {
+                      name:  report['name'],
+                      emoji: report['emoji']
+                    }
+                  end
+                end
+              end
+
+              round = report['rounds'][0]  # exactly 1 round per child
+
+              all_score[k][idx]            = round['score']
+              all_utilization[k][idx]      = round['gem_utilization']
+              all_ttfc[k][idx]             = round['ticks_to_first_capture']
+              all_tc[k][idx]               = round['floor_coverage'] # named "floor_coverage" in JSON
+              all_disqualified_for[k][idx] = round['disqualified_for']
+              all_response_time_stats[k][idx] = round['response_time_stats']
+              all_stderr_logs[k][idx]      = round['stderr_log']
             end
-            d
+          end
+        ensure
+          # Progress update
+          progress_mutex.synchronize do
+            completed += 1
+            now = Time.now
+            if completed == total_rounds || (now - last_print_time) >= 0.5
+              print_progress.call
+              last_print_time = now
+            end
+          end
         end
-        all_reports << report
+      end
     end
-    if write_profile_json_path
-        File.open(write_profile_json_path, 'w') do |f|
-            f.write(all_reports.to_json)
-        end
+  end
+
+  workers.each(&:join)
+  $stderr.puts
+
+  # --- From here down: same logic as runner.rb multi-round branch ---
+
+  puts
+
+  all_reports = []
+  bot_data.each_with_index do |data, i|
+    next unless data # in case some child completely failed
+
+    puts "Results for #{data[:emoji]} #{data[:name]}"
+
+    n    = all_utilization[i].size
+    mean = all_utilization[i].sum(0.0) / n
+    var  = all_utilization[i].map { |x| (x - mean) ** 2 }.sum / n
+    sd   = Math.sqrt(var)
+    cv   = sd / mean * 100.0
+
+    puts sprintf("Total Score     : %5d", all_score[i].sum)
+    puts sprintf("Gem Utilization : %5.1f %%", mean)
+    if cv.nan?
+      puts sprintf("Chaos Factor    :     -")
+    else
+      puts sprintf("Chaos Factor    : %5.1f %%", cv)
     end
+    puts sprintf("Floor Coverage  : %5.1f %%", mean(all_tc[i]))
+
+    report = {}
+    report[:timestamp]            = Time.now.to_i
+    report[:stage_key]            = stage_key
+    report[:stage_title]          = stage_title
+    report[:git_hash]             = `git describe --always --dirty`.strip
+    report[:seed]                 = og_seed.to_s(36)
+    report[:name]                 = data[:name]
+    report[:emoji]                = data[:emoji]
+    report[:total_score]          = all_score[i].sum
+    report[:gem_utilization_mean] = mean
+    report[:gem_utilization_cv]   = cv.nan? ? nil : cv
+    report[:floor_coverage_mean]  = mean(all_tc[i])
+
+    report[:rounds] = all_score[i].map.with_index do |_, k|
+      d = {
+        :seed                  => all_seed[k].to_s(36),
+        :score                 => all_score[i][k],
+        :gem_utilization       => all_utilization[i][k],
+        :floor_coverage        => all_tc[i][k],
+        :ticks_to_first_capture => all_ttfc[i][k],
+        :disqualified_for      => all_disqualified_for[i][k],
+        :response_time_stats   => all_response_time_stats[i][k],
+      }
+      if d[:disqualified_for]
+        d[:stderr_log] = all_stderr_logs[i][k]
+      end
+      d
+    end
+
+    all_reports << report
+  end
+
+  if write_profile_json_path
+    File.open(write_profile_json_path, 'w') do |f|
+      f.write(JSON.pretty_generate(all_reports))
+    end
+  end
 end
 
 if options[:show_timings]
