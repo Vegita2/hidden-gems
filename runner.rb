@@ -1675,7 +1675,7 @@ options = {
     start_paused: false,
     highlight_color: '#ffffff',
     enable_debug: true,
-    timeout_scale: 1.0,
+    timeout_scale: 100000.0,
 }
 
 unless ARGV.include?('--stage')
@@ -2012,12 +2012,13 @@ else
     all_utilization = bot_paths.map { [] }
     all_ttfc = bot_paths.map { [] }
     all_tc = bot_paths.map { [] }
-    all_seed = []
+    collect_profile = !write_profile_json_path.nil?
+    all_seed = collect_profile ? [] : nil
     all_disqualified_for = bot_paths.map { [] }
-    all_response_time_stats = bot_paths.map { [] }
-    all_stderr_logs = bot_paths.map { [] }
-    all_options = []
-    all_events = []
+    all_response_time_stats = collect_profile ? bot_paths.map { [] } : nil
+    all_stderr_logs = collect_profile ? bot_paths.map { [] } : nil
+    all_options = collect_profile ? [] : nil
+    all_events = collect_profile ? [] : nil
 
     bot_data = []
 
@@ -2027,7 +2028,7 @@ else
         else
             options[:seed] = seed_rng.randrange(2 ** 48)
         end
-        all_seed << options[:seed]
+        all_seed << options[:seed] if collect_profile
         runner = Runner.new(**options)
         runner.round = i
         runner.stage_title = stage_title if stage_title
@@ -2039,17 +2040,19 @@ else
                 bot_data << {:name => bot[:name], :emoji => bot[:emoji]}
             end
         end
-        all_options << runner.options_hash()
+        all_options << runner.options_hash() if collect_profile
         results, events = runner.run
-        all_events << events
+        all_events << events if collect_profile
         (0...bot_paths.size).each do |k|
             all_score[k] << results[k][:score]
             all_utilization[k] << results[k][:gem_utilization]
             all_ttfc[k] << results[k][:ticks_to_first_capture]
             all_tc[k] << results[k][:tile_coverage]
             all_disqualified_for[k] << results[k][:disqualified_for]
-            all_response_time_stats[k] << results[k][:response_time_stats]
-            all_stderr_logs[k] << results[k][:stderr_log]
+            if collect_profile
+                all_response_time_stats[k] << results[k][:response_time_stats]
+                all_stderr_logs[k] << results[k][:stderr_log]
+            end
         end
     end
     puts
@@ -2072,6 +2075,7 @@ else
             puts sprintf("Chaos Factor    : %5.1f %%", cv)
         end
         puts sprintf("Floor Coverage  : %5.1f %%", mean(all_tc[i]))
+        next unless collect_profile
         report = {}
         report[:timestamp] = Time.now.to_i
         report[:stage_key] = stage_key
