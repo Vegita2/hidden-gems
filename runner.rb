@@ -4,10 +4,11 @@ $LOAD_PATH.unshift File.expand_path("include/unicode-emoji-4.0.4/lib", __dir__)
 $LOAD_PATH.unshift File.expand_path("include/unicode-display_width-3.1.5/lib", __dir__)
 $LOAD_PATH.unshift File.expand_path("include/paint-2.3.0/lib", __dir__)
 
-require './include/fov_angle.rb'
-require './include/key_input.rb'
-require './include/pcg32.rb'
-require './include/timings.rb'
+$LOAD_PATH.unshift File.expand_path(__dir__)
+require 'include/fov_angle'
+require 'include/key_input'
+require 'include/pcg32'
+require 'include/timings'
 if Gem.win_platform?
     require 'fiddle/import'
 end
@@ -15,6 +16,7 @@ end
 require 'date'
 require 'digest'
 require 'fileutils'
+require 'io/console'
 require 'json'
 require 'open3'
 require 'openssl'
@@ -34,8 +36,9 @@ OVERTIME_BUDGET       = 1.5
 
 OPTIONS_FOR_BOT = %w(stage_key width height generator max_ticks emit_signals
                      emit_signal_channels vis_radius max_gems gem_spawn_rate
-                     gem_ttl signal_radius signal_cutoff signal_noise
-                     signal_quantization signal_fade enable_debug timeout_scale)
+                     gem_ttl max_antennas max_portals signal_radius
+                     signal_cutoff signal_noise signal_quantization
+                     signal_fade enable_debug timeout_scale)
 
 ANSI = /\e\[[0-9;:<>?]*[@-~]/
 
@@ -105,7 +108,7 @@ class Runner
     UI_BACKGROUND_BOTTOM = '#232626'
     UI_FOREGROUND_BOTTOM = '#d3d7cf'
 
-    PORTAL_EMOJIS = ['🔴', '🔵', '🟢', '🟡']
+    PORTAL_EMOJIS = %w(🔴 🟠 🟡 🟢 🔵 🟣 ⚪ ⚫)
     ANTENNA_EMOJI = '📡'
     GEM_EMOJI = '💎'
     ANNOUNCER_EMOJI = '🎙️'
@@ -159,19 +162,20 @@ class Runner
     Bot = Struct.new(:stdin, :stdout, :stderr, :wait_thr)
 
     attr_accessor :round, :stage_title, :stage_key, :timeout_scale
-    attr_reader :bots, :rng
+    attr_reader :bots, :rng, :interactive_mode
 
     def initialize(seed:, width:, height:, generator:, max_ticks:,
                    vis_radius:, gem_spawn_rate:, gem_ttl:, max_gems:,
-                   emit_signals:, emit_signal_channels:,signal_radius:,
-                   signal_quantization:, signal_noise:, signal_cutoff:,
-                   signal_fade:, swap_bots:, cache:, profile:,
-                   check_determinism:, use_docker:, docker_workdirs:,
-                   rounds:, round_seeds:, verbose:, max_tps:,
-                   announcer_enabled:, bot_chatter:, ansi_log_path:,
-                   write_highlights:, write_stdin:, show_timings:,
-                   start_paused:, contest_mode:, highlight_color:,
-                   enable_debug:, timeout_scale:
+                   max_antennas:, max_portals:, emit_signals:,
+                   emit_signal_channels:, signal_radius:,
+                   signal_quantization:, signal_noise:,
+                   signal_cutoff:, signal_fade:, swap_bots:, cache:,
+                   profile:, check_determinism:, use_docker:,
+                   docker_workdirs:, rounds:, round_seeds:, verbose:,
+                   max_tps:, announcer_enabled:, bot_chatter:,
+                   ansi_log_path:, write_highlights:, write_stdin:,
+                   show_timings:, start_paused:, contest_mode:,
+                   highlight_color:, enable_debug:, timeout_scale:
                    )
         @seed = seed
         @width = width
@@ -182,6 +186,8 @@ class Runner
         @gem_spawn_rate = gem_spawn_rate
         @gem_ttl = gem_ttl
         @max_gems = max_gems
+        @max_antennas = max_antennas
+        @max_portals = max_portals
         @emit_signals = emit_signals
         @emit_signal_channels = emit_signal_channels
         @signal_radius = signal_radius
@@ -224,10 +230,11 @@ class Runner
         @timeout_scale = timeout_scale
         @faded_highlight_color = mix_rgb_hex(@highlight_color, '#000000', 0.25)
         @demo_mode = @ansi_log_path && File.basename(@ansi_log_path).include?('demo')
+        @interactive_mode = false
 
         param_rng = PCG32.new(@seed)
-        [:width, :height, :max_ticks, :vis_radius, :gem_ttl, :max_gems,
-         :signal_radius, :signal_fade, :rounds].each do |_key|
+        [:width, :height, :max_ticks, :vis_radius, :gem_ttl, :max_gems, :max_antennas,
+         :max_portals, :signal_radius, :signal_fade, :rounds].each do |_key|
             key = "@#{_key}".to_sym
             value = instance_variable_get(key)
             if value.is_a?(String) && value.include?('..')
@@ -253,7 +260,8 @@ class Runner
     end
 
     def gen_maze
-        command = "node ./include/maze.js --width #{@width} --height #{@height} --generator #{@generator} --seed #{@seed} --wall \"#\" --floor \".\""
+        maze_script = File.expand_path("include/maze.js", __dir__)
+        command = "node \"#{maze_script}\" --width #{@width} --height #{@height} --generator #{@generator} --seed #{@seed} --wall \"#\" --floor \".\""
         maze = `#{command}`.strip.split("\n").map { |x| x.strip }.select do |line|
             line =~ /^[\.#]+$/
         end.map.with_index do |line, y|
@@ -494,6 +502,107 @@ class Runner
         end
     end
 
+    def read_interactive_command(prompt = "Your move> ")
+        buffer = +""
+
+        print prompt
+        STDOUT.flush
+
+        loop do
+            ch = STDIN.getch
+
+            case ch
+            when "\r", "\n"
+                puts
+                cmd = buffer.strip
+                return cmd.empty? ? "WAIT" : cmd.upcase
+
+            when "\u0003" # Ctrl-C
+                raise Interrupt
+
+            when "\u007F", "\b" # Backspace on Unix/Windows
+                unless buffer.empty?
+                    buffer.chop!
+                    print "\b \b"
+                    STDOUT.flush
+                end
+
+            when "\e" # ANSI escape sequence: arrows on Linux/macOS, sometimes Windows terminals too
+                begin
+                    ch2 = STDIN.read_nonblock(1)
+                    if ch2 == "["
+                        ch3 = STDIN.read_nonblock(1)
+                        case ch3
+                        when "A" then puts; return "N"
+                        when "B" then puts; return "S"
+                        when "C" then puts; return "E"
+                        when "D" then puts; return "W"
+                        end
+                    end
+                rescue IO::WaitReadable, EOFError
+                end
+
+            when "\u0000", "\u00E0" # Windows extended keys
+                begin
+                    ch2 = STDIN.getch
+                    case ch2
+                    when "H" then puts; return "N" # up
+                    when "P" then puts; return "S" # down
+                    when "M" then puts; return "E" # right
+                    when "K" then puts; return "W" # left
+                    end
+                rescue EOFError
+                end
+
+            else
+                # Allow regular typed commands like WAIT, PAN, P1N, json, etc.
+                if ch >= " " && ch != "\e"
+                    buffer << ch
+                    print ch
+                    STDOUT.flush
+                end
+            end
+        end
+    end
+
+    def start_interactive_bot(bot_index)
+        bot_stdin_r, bot_stdin_w = IO.pipe
+        bot_stdout_r, bot_stdout_w = IO.pipe
+
+        thread = Thread.new do
+            loop do
+                line = bot_stdin_r.gets
+                break if line.nil?
+
+                begin
+                    parsed = JSON.parse(line)
+                    compact = parsed.to_json
+                rescue
+                    compact = line
+                end
+
+                puts
+                puts "=== INTERACTIVE BOT #{bot_index} INPUT ==="
+                puts compact
+                puts "=== END INPUT ==="
+                puts "Attention: Don't hold keys pressed, don't press multiple keys at once. You may use arrow keys to navigate."
+
+                response = STDIN.raw { read_interactive_command("Your move> ") }
+                break if response.nil?
+
+                bot_stdout_w.puts(response.strip.upcase)
+                bot_stdout_w.flush
+            end
+        end
+
+        stdin  = bot_stdin_w
+        stdout = bot_stdout_r
+        stderr = StringIO.new
+        wait_thr = Struct.new(:pid).new(thread.object_id)
+
+        Bot.new(stdin, stdout, stderr, wait_thr)
+    end
+
     def mix_rgb_hex(c1, c2, t)
         x = c1[1..].scan(/../).map { |h| h.to_i(16) }
         y = c2[1..].scan(/../).map { |h| h.to_i(16) }
@@ -632,7 +741,7 @@ class Runner
         str.gsub(/\e\[[0-9;]*[A-Za-z]/, '')
     end
 
-    def render(tick, signal_level, paused)
+    def render(tick, signal_level, paused, placed_antennas, placed_portals)
         fg_top_mix = mix_rgb_hex(UI_FOREGROUND_TOP, UI_BACKGROUND_TOP, 0.5)
         fg_bottom_mix = mix_rgb_hex(UI_FOREGROUND_BOTTOM, UI_BACKGROUND_BOTTOM, 0.5)
         StringIO.open do |io|
@@ -684,6 +793,15 @@ class Runner
 
             bot_highlights = []
 
+            portal_override = {}
+            placed_portals.each.with_index do |portals_for_bot, bot_index|
+                portals_for_bot.each.with_index do |portal_pair, portal_index|
+                    portal_pair.each do |portal|
+                        portal_override[portal[0]] = PORTAL_EMOJIS[(bot_index * 4 + portal_index) % PORTAL_EMOJIS.size]
+                    end
+                end
+            end
+
             if @enable_debug
                 @bots.each.with_index do |x, i|
                     bot_highlights[i] = {}
@@ -717,7 +835,8 @@ class Runner
                         c = ' ' * @tile_width
                         bg = FLOOR_COLOR
                         offset = (y << 16) | x
-                        if @maze.include?(offset)
+                        have_antenna = placed_antennas.any? { |x| x.include?(offset) }
+                        if @maze.include?(offset) && !have_antenna
                             unless @wall_color_cache.include?(offset)
                                 @wall_color_cache[offset] = mix_rgb_hex(WALL_COLOR, '#000000', paint_rng.next_float() * 0.25)
                             end
@@ -747,13 +866,27 @@ class Runner
                                 end
                                 if @emit_signals
                                     if signal_level[i].include?((y << 16) | x)
-                                        level = signal_level[i][(y << 16) | x]
-                                        # clamp signal level for rendering
-                                        level = 0.0 if level < 0.0
-                                        level = 1.0 if level > 1.0
-                                        bg = mix_rgb_hex(GEM_COLOR, bg, 1.0 - level)
+                                        unless @maze.include?((y << 16) | x) && !have_antenna
+                                            level = signal_level[i][(y << 16) | x]
+                                            # clamp signal level for rendering
+                                            level = 0.0 if level < 0.0
+                                            level = 1.0 if level > 1.0
+                                            bg = mix_rgb_hex(GEM_COLOR, bg, 1.0 - level)
+                                        end
                                     end
                                 end
+                            end
+                        end
+                        if have_antenna
+                            c = ANTENNA_EMOJI
+                            while vwidth(c) < @tile_width
+                                c += ' '
+                            end
+                        end
+                        if portal_override.include?(offset)
+                            c = portal_override[offset]
+                            while vwidth(c) < @tile_width
+                                c += ' '
                             end
                         end
                         highlight_color = nil
@@ -882,6 +1015,21 @@ class Runner
 
     def add_bot(path, bot_args = [])
         @bots << {:position => @spawn_points.shift, :score => 0, :name => "Botty McBotface", :emoji => '🤖', :overtime_used => 0.0, :disqualified_for => nil, :response_times => [], :stderr_log => []}
+
+        bot_index = @bots_io.size
+
+        if File.basename(path) == "interactive"
+            @interactive_mode = true
+            @bots.last[:name] = "Interactive"
+            @bots.last[:emoji] = '🤖'
+
+            # Disable timeouts entirely
+            @timeout_scale = 1e9
+
+            @bots_io << start_interactive_bot(bot_index)
+            return
+        end
+
         yaml_path = File.join(File.expand_path(path), 'bot.yaml')
         if File.exist?(yaml_path)
             info = YAML.load(File.read(yaml_path))
@@ -894,14 +1042,14 @@ class Runner
                 raise "Error in bot.yaml: emoji must be at most 2 characters wide (#{@bots.last[:emoji]} is #{vwidth(@bots.last[:emoji])} characters wide)"
             end
         end
-        bot_index = @bots_io.size
+
         @bots_io << start_bot(path, @docker_workdirs[bot_index], bot_args) do |line|
             @message_queue << {:bot => bot_index, :line => line}
             @bots[bot_index][:stderr_log] << line
         end
     end
 
-    def spawn_gem(channel)
+    def spawn_gem(channel, placed_antennas)
         spawn_data = @gem_fel[@gem_fel_index]
         @gem_fel_index += 1
 
@@ -916,6 +1064,11 @@ class Runner
         end
         @bots.each do |b|
             occupied_points << ((b[:position][1] << 16) | b[:position][0])
+        end
+        placed_antennas.each do |a|
+            a.each do |offset|
+                occupied_points << offset
+            end
         end
 
         dist_field = {}
@@ -985,9 +1138,7 @@ class Runner
                                     l = ((l * q).floor).to_f / q
                                 end
                                 l = 0.0 if l < @signal_cutoff.to_f
-                                unless @maze.include?(offset)
-                                    level[offset] = l
-                                end
+                                level[offset] = l
                                 seen[offset] = true
                                 new_wavefront << [dx, dy]
                             end
@@ -1128,9 +1279,11 @@ class Runner
         @tick = 0
         @tps = 0
         t0 = Time.now.to_f
-        begin
-            STDIN.echo = false
-        rescue
+        unless @interactive_mode
+            begin
+                STDIN.echo = false
+            rescue
+            end
         end
         results = @bots.map do |b|
              { :ticks_to_first_capture => nil }
@@ -1141,6 +1294,16 @@ class Runner
         ttl_spawned = 0
         color_to_index = {'#00000000' => 0}
         index_to_color = ['#00000000']
+
+        antenna_stock = @bots.map { |b| @max_antennas }
+        placed_antennas = @bots.map { |b| [] }
+        # placed_portals:
+        # - for each bot:
+        #  - for each portal index:
+        #    - list with 0, 1 or 2 entries of:
+        #      - offset of placed portal
+        #      - offset the portal was placed from
+        placed_portals = @bots.map { |b| (0...@max_portals).map { |i| [] } }
 
         @events = []
         @events << { :type => 'match_start', :bots => @bots.map { |b| { name: b[:name], emoji: b[:emoji], position: b[:position] } } }
@@ -1168,7 +1331,7 @@ class Runner
         @paused = @start_paused
         break_on_tick = nil
         begin
-            print "\033[?25l" if @verbose >= 2
+            print "\033[?25l" if @verbose >= 2 && !@interactive_mode
             loop do
                 break if break_on_tick && @tick >= break_on_tick
                 tf0 = Time.now.to_f
@@ -1250,10 +1413,13 @@ class Runner
                     if @verbose >= 2 || @ansi_log_path
                         screen = nil
                         $timings.profile("render screen") do
-                            screen = render(running_tick, signal_level, @paused)
+                            screen = render(running_tick, signal_level, @paused, placed_antennas, placed_portals)
                         end
                         # @protocol.last[:screen] = screen
                         if @verbose >= 2
+                            if @interactive_mode
+                                print "\033[2J\033[H"
+                            end
                             print screen
                         end
                         frames << screen
@@ -1329,12 +1495,40 @@ class Runner
                             data[:bot] = bot[:position]
                             data[:wall] = []
                             data[:floor] = []
+                            if @max_antennas > 0
+                                data[:antennas] = []
+                            end
+                            if @max_portals > 0
+                                data[:portals] = []
+                                data[:portal_stubs] = []
+                            end
+
                             data[:initiative] = (bot_with_initiative == i)
                             data[:visible_gems] = []
                             vis_key = (bot[:position][1] << 16) | bot[:position][0]
                             @visibility[vis_key].each do |t|
                                 key = @maze.include?(t) ? :wall : :floor
                                 data[key] << [t & 0xFFFF, t >> 16]
+                                if @max_antennas > 0
+                                    if placed_antennas.any? { |x| x.include?(t) }
+                                        data[:antennas] << [t & 0xFFFF, t >> 16]
+                                    end
+                                end
+                                if @max_portals > 0
+                                    placed_portals.each.with_index do |portals_for_bot, bot_index|
+                                        portals_for_bot.each.with_index do |portal_pair, portal_index|
+                                            portal_pair.each do |portal|
+                                                if portal[0] == t
+                                                    if portal_pair.size == 2
+                                                        data[:portals] << [t & 0xFFFF, t >> 16]
+                                                    else
+                                                        data[:portal_stubs] << [t & 0xFFFF, t >> 16]
+                                                    end
+                                                end
+                                            end
+                                        end
+                                    end
+                                end
                                 @gems.each do |gem|
                                     if gem[:position_offset] == t
                                         data[:visible_gems] << { :position => gem[:position], :ttl => gem[:ttl] }
@@ -1353,6 +1547,15 @@ class Runner
                                         channel = g[:channel]
                                         level = signal_level[gi][vis_key] || 0.0
                                         data[:channels][channel] = format("%.6f", level).to_f
+                                    end
+                                end
+                                if @max_antennas > 0
+                                    data[:antenna_signals] = []
+                                    placed_antennas[i].each do |a|
+                                        ax = a & 0xFFFF
+                                        ay = a >> 16
+                                        signal = signal_level.each_with_index.map { |l, gi| l[a] || 0.0 }.sum
+                                        data[:antenna_signals] << { :position => [ax, ay], :signal => format("%.6f", signal).to_f }
                                     end
                                 end
                             end
@@ -1530,12 +1733,13 @@ class Runner
 
                             bot_position = @bots[i][:position]
                             prev_bot_position = bot_position.dup
-                            if ['N','E','S','W'].include?(command)
-                                dir = {'N'=>[0,-1],'E'=>[1,0],'S'=>[0,1],'W'=>[-1,0]}
+                            dir = {'N'=>[0,-1],'E'=>[1,0],'S'=>[0,1],'W'=>[-1,0]}
+                            if command =~ /^[NESW]$/
+                                # move NESW
                                 dx = bot_position[0] + dir[command][0]
                                 dy = bot_position[1] + dir[command][1]
                                 if dx >= 0 && dy >= 0 && dx < @width && dy < @height
-                                    unless @maze.include?((dy << 16) | dx)
+                                    if (!@maze.include?((dy << 16) | dx))
                                         target_occupied_by_bot = nil
                                         (0...@bots.size).each do |other|
                                             next if other == i
@@ -1546,6 +1750,112 @@ class Runner
                                             end
                                         end
                                         @bots[i][:position] = [dx, dy] if target_occupied_by_bot.nil?
+                                    elsif @max_portals > 0
+                                        # check for portal
+                                        placed_portals.each_with_index do |portals_for_bot, bot_index|
+                                            portals_for_bot.each_with_index do |portal_pair, portal_index|
+                                                portal_pair.each.with_index do |portal, portal_half_index|
+                                                    if portal[0] == ((dy << 16) | dx)
+                                                        # teleport to other half if exists, otherwise ignore move
+                                                        if portal_pair.size == 2
+                                                            other_half = portal_pair[1 - portal_half_index]
+                                                            other_half_x = other_half[1] & 0xFFFF
+                                                            other_half_y = other_half[1] >> 16
+                                                            target_occupied_by_bot = nil
+                                                            (0...@bots.size).each do |other|
+                                                                next if other == i
+                                                                next if @bots[other][:disqualified_for]
+                                                                if @bots[other][:position] == [other_half_x, other_half_y]
+                                                                    target_occupied_by_bot = other
+                                                                    break
+                                                                end
+                                                            end
+                                                            @bots[i][:position] = [other_half_x, other_half_y] if target_occupied_by_bot.nil?
+                                                        end
+                                                    end
+                                                end
+                                            end
+                                        end
+                                    end
+                                end
+                            elsif @max_antennas > 0 && command =~ /^PA[NESW]$/
+                                # Place Antenna NESW
+                                dx = bot_position[0] + dir[command[2]][0]
+                                dy = bot_position[1] + dir[command[2]][1]
+                                if dx >= 0 && dy >= 0 && dx < @width && dy < @height
+                                    offset = (dy << 16) | dx
+                                    target_occupied_by_bot = nil
+                                    (0...@bots.size).each do |other|
+                                        next if other == i
+                                        next if @bots[other][:disqualified_for]
+                                        if @bots[other][:position] == [dx, dy]
+                                            target_occupied_by_bot = other
+                                            break
+                                        end
+                                    end
+                                    target_occupied_by_gem = nil
+                                    @gems.each_with_index do |gem, gi|
+                                        if gem[:position] == [dx, dy]
+                                            target_occupied_by_gem = gi
+                                            break
+                                        end
+                                    end
+                                    target_occupied_by_antenna = placed_antennas.any? { |x| x.include?(offset) }
+                                    if @maze.include?(offset) && target_occupied_by_bot.nil? && target_occupied_by_gem.nil? && !target_occupied_by_antenna && antenna_stock[i] > 0
+                                        antenna_stock[i] -= 1
+                                        placed_antennas[i] << offset
+                                        @maze << offset
+                                        if @announcer_enabled
+                                            @chatlog << {emoji: ANNOUNCER_EMOJI, text: "#{@bots[i][:name]} placed an antenna (#{antenna_stock[i]} antenna#{antenna_stock[i] == 1 ? '' : 's'} remaining)." }
+                                            @events << { tick: @tick, type: 'antenna_placed', bot: i, position: [dx, dy], remaining_stock: antenna_stock[i] }
+                                        end
+                                    end
+                                end
+                            elsif @max_portals > 0 && command =~ /^P[1-4][NESW]$/
+                                # Place Portal 1-4 NESW
+                                portal_id = command[1].to_i - 1
+                                if portal_id >= 0 && portal_id < @max_portals
+                                    dx = bot_position[0] + dir[command[2]][0]
+                                    dy = bot_position[1] + dir[command[2]][1]
+                                    if dx >= 0 && dy >= 0 && dx < @width && dy < @height
+                                        offset = (dy << 16) | dx
+                                        # target must be on wall
+                                        if @maze.include?(offset)
+                                            # target must not be part of another portal (complete or incomplete)
+                                            occupied = false
+                                            placed_portals.each do |portals_for_bot|
+                                                portals_for_bot.each do |portal_pair|
+                                                    portal_pair.each do |portal|
+                                                        if portal.include?(offset)
+                                                            occupied = true
+                                                            break
+                                                        end
+                                                    end
+                                                end
+                                                break if occupied
+                                            end
+                                            unless occupied
+                                                # each portal can have at most 2 placements (entrance and exit)
+                                                if placed_portals[i][portal_id].size < 2
+                                                    # prepare entry with portal offset and bot position at time of placement
+                                                    entry = [offset, (bot_position[1] << 16) | bot_position[0]]
+                                                    placed_portals[i][portal_id] << entry
+                                                    if placed_portals[i][portal_id].size == 1
+                                                        @events << { tick: @tick, type: 'portal_half_placed', bot: i, portal_id: portal_id, position: [dx, dy] }
+                                                    else
+                                                        @events << { tick: @tick, type: 'portal_completed', bot: i, portal_id: portal_id, position: [dx, dy] }
+                                                    end
+                                                    if @announcer_enabled
+                                                        if placed_portals[i][portal_id].size == 1
+                                                            @chatlog << {emoji: ANNOUNCER_EMOJI, text: "#{@bots[i][:name]} placed the first half of portal #{portal_id + 1}." }
+                                                        else
+                                                            @chatlog << {emoji: ANNOUNCER_EMOJI, text: "#{@bots[i][:name]} completed portal #{portal_id + 1}." }
+                                                        end
+                                                    end
+                                                end
+                                            end
+
+                                        end
                                     end
                                 end
                             elsif command == 'WAIT'
@@ -1619,7 +1929,7 @@ class Runner
                                     @tick >= @channel_blocked_until[channel]
                                 end
                                 unless can_spawn_channels.empty?
-                                    ttl_spawned += spawn_gem(@rng.sample(can_spawn_channels))
+                                    ttl_spawned += spawn_gem(@rng.sample(can_spawn_channels), placed_antennas)
                                     @events << { tick: @tick, type: 'gem_spawned', position: @gems.last[:position], ttl: @gems.last[:ttl], id: @gems.last[:id] }
                                 end
                             end
@@ -1668,7 +1978,7 @@ class Runner
                 kill_bot_process(b)
             end
         ensure
-            print "\033[?25h" if @verbose >= 2
+            print "\033[?25h" if @verbose >= 2 && !@interactive_mode
             begin
                 STDIN.echo = true
             rescue
@@ -1735,7 +2045,7 @@ class Runner
     end
 end
 
-stages = YAML.load(File.read('stages.yaml'))
+stages = YAML.load_file(File.join(__dir__, 'stages.yaml'))
 
 options = {
     stage: 'current',
@@ -1748,6 +2058,8 @@ options = {
     max_gems: 1,
     gem_spawn_rate: 0.05,
     gem_ttl: 300,
+    max_antennas: 0,
+    max_portals: 0,
     signal_radius: 10.0,
     signal_cutoff: 0.0,
     signal_noise: 0.0,
@@ -1775,7 +2087,7 @@ options = {
     contest_mode: false,
     highlight_color: '#ffffff',
     enable_debug: true,
-    timeout_scale: 100000.0,
+    timeout_scale: 1.0,
 }
 
 unless ARGV.include?('--stage')
@@ -1858,6 +2170,12 @@ OptionParser.new do |opts|
     end
     opts.on("--max-gems GEMS", Integer, "Max. number of gems (default: #{options[:max_gems]})") do |x|
         options[:max_gems] = x
+    end
+    opts.on("--max-antennas N", Integer, "Max. number of antennas per bot (default: #{options[:max_antennas]})") do |x|
+        options[:max_antennas] = x
+    end
+    opts.on("--max-portals N", Integer, "Max. number of portals per bot (default: #{options[:max_portals]})") do |x|
+        options[:max_portals] = x
     end
     opts.on("-e", "--[no-]emit-signals", "Enable gem signals (default: #{options[:emit_signals]})") do |x|
         options[:emit_signals] = x
@@ -1963,7 +2281,7 @@ end.parse!(runner_argv)
 positional = runner_argv.dup
 
 if positional.empty?
-    positional = ["random-walker"]
+    positional = [File.expand_path("random-walker", __dir__)]
 end
 
 if positional.size > 2
@@ -2002,7 +2320,7 @@ if options[:swap_bots]
 end
 
 if bot_paths.empty?
-    bot_paths << "random-walker"
+    bot_paths << File.expand_path("random-walker", __dir__)
 end
 
 if bot_paths.size > 2
@@ -2072,7 +2390,7 @@ if options[:rounds] == 1
             report[:stage_key] = stage_key
             report[:stage_title] = stage_title
             begin
-                report[:git_hash] = `git describe --always --dirty`.strip
+                report[:git_hash] = `git -C "#{__dir__}" describe --always --dirty`.strip
             rescue
             end
             report[:seed] = og_seed.to_s(36)
@@ -2121,13 +2439,12 @@ else
     all_utilization = bot_paths.map { [] }
     all_ttfc = bot_paths.map { [] }
     all_tc = bot_paths.map { [] }
-    collect_profile = !write_profile_json_path.nil?
-    all_seed = collect_profile ? [] : nil
+    all_seed = []
     all_disqualified_for = bot_paths.map { [] }
-    all_response_time_stats = collect_profile ? bot_paths.map { [] } : nil
-    all_stderr_logs = collect_profile ? bot_paths.map { [] } : nil
-    all_options = collect_profile ? [] : nil
-    all_events = collect_profile ? [] : nil
+    all_response_time_stats = bot_paths.map { [] }
+    all_stderr_logs = bot_paths.map { [] }
+    all_options = []
+    all_events = []
 
     bot_data = []
 
@@ -2137,7 +2454,7 @@ else
         else
             options[:seed] = seed_rng.randrange(2 ** 48)
         end
-        all_seed << options[:seed] if collect_profile
+        all_seed << options[:seed]
         runner = Runner.new(**options)
         runner.round = i
         runner.stage_title = stage_title if stage_title
@@ -2149,19 +2466,17 @@ else
                 bot_data << {:name => bot[:name], :emoji => bot[:emoji]}
             end
         end
-        all_options << runner.options_hash() if collect_profile
+        all_options << runner.options_hash()
         results, events = runner.run
-        all_events << events if collect_profile
+        all_events << events
         (0...bot_paths.size).each do |k|
             all_score[k] << results[k][:score]
             all_utilization[k] << results[k][:gem_utilization]
             all_ttfc[k] << results[k][:ticks_to_first_capture]
             all_tc[k] << results[k][:tile_coverage]
             all_disqualified_for[k] << results[k][:disqualified_for]
-            if collect_profile
-                all_response_time_stats[k] << results[k][:response_time_stats]
-                all_stderr_logs[k] << results[k][:stderr_log]
-            end
+            all_response_time_stats[k] << results[k][:response_time_stats]
+            all_stderr_logs[k] << results[k][:stderr_log]
         end
     end
     puts
@@ -2184,13 +2499,12 @@ else
             puts sprintf("Chaos Factor    : %5.1f %%", cv)
         end
         puts sprintf("Floor Coverage  : %5.1f %%", mean(all_tc[i]))
-        next unless collect_profile
         report = {}
         report[:timestamp] = Time.now.to_i
         report[:stage_key] = stage_key
         report[:stage_title] = stage_title
         begin
-            report[:git_hash] = `git describe --always --dirty`
+            report[:git_hash] = `git -C "#{__dir__}" describe --always --dirty`
         rescue
         end
         report[:seed] = og_seed.to_s(36)
