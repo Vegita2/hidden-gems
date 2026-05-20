@@ -842,37 +842,33 @@ class Runner
                             end
                             bg = @wall_color_cache[offset]
                         end
-                        $timings.profile("find bots") do
-                            (0...@bots.size).each do |_k|
-                                i = (_k + bot_with_initiative) % @bots.size
-                                bot = @bots[i]
-                                next if bot[:disqualified_for]
-                                p = bot[:position]
-                                if p[0] == x && p[1] == y
-                                    c = @bots[i][:emoji]
-                                    while vwidth(c) < @tile_width
-                                        c += ' '
-                                    end
+                        (0...@bots.size).each do |_k|
+                            i = (_k + bot_with_initiative) % @bots.size
+                            bot = @bots[i]
+                            next if bot[:disqualified_for]
+                            p = bot[:position]
+                            if p[0] == x && p[1] == y
+                                c = @bots[i][:emoji]
+                                while vwidth(c) < @tile_width
+                                    c += ' '
                                 end
                             end
                         end
-                        $timings.profile("find gems") do
-                            @gems.each.with_index do |p, i|
-                                if p[:position][0] == x && p[:position][1] == y
-                                    c = GEM_EMOJI
-                                    while vwidth(c) < @tile_width
-                                        c += ' '
-                                    end
+                        @gems.each.with_index do |p, i|
+                            if p[:position][0] == x && p[:position][1] == y
+                                c = GEM_EMOJI
+                                while vwidth(c) < @tile_width
+                                    c += ' '
                                 end
-                                if @emit_signals
-                                    if signal_level[i].include?((y << 16) | x)
-                                        unless @maze.include?((y << 16) | x) && !have_antenna
-                                            level = signal_level[i][(y << 16) | x]
-                                            # clamp signal level for rendering
-                                            level = 0.0 if level < 0.0
-                                            level = 1.0 if level > 1.0
-                                            bg = mix_rgb_hex(GEM_COLOR, bg, 1.0 - level)
-                                        end
+                            end
+                            if @emit_signals
+                                if signal_level[i].include?((y << 16) | x)
+                                    unless @maze.include?((y << 16) | x) && !have_antenna
+                                        level = signal_level[i][(y << 16) | x]
+                                        # clamp signal level for rendering
+                                        level = 0.0 if level < 0.0
+                                        level = 1.0 if level > 1.0
+                                        bg = mix_rgb_hex(GEM_COLOR, bg, 1.0 - level)
                                     end
                                 end
                             end
