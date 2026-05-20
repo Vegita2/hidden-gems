@@ -829,6 +829,35 @@ class Runner
                 end
             end
 
+            bot_emoji_at = {}
+            (0...@bots.size).each do |_k|
+                i = (_k + bot_with_initiative) % @bots.size
+                bot = @bots[i]
+                next if bot[:disqualified_for]
+                p = bot[:position]
+                emoji = @bots[i][:emoji]
+                while vwidth(emoji) < @tile_width
+                    emoji += ' '
+                end
+                bot_emoji_at[(p[1] << 16) | p[0]] = emoji
+            end
+
+            gem_offsets = {}
+            @gems.each { |g| gem_offsets[g[:position_offset]] = true }
+
+            signal_by_offset = nil
+            if @emit_signals
+                signal_by_offset = Hash.new { |h, k| h[k] = [] }
+                signal_level.each_with_index do |levels, gi|
+                    levels.each { |off, lvl| signal_by_offset[off] << lvl }
+                end
+            end
+
+            gem_emoji_padded = GEM_EMOJI.dup
+            while vwidth(gem_emoji_padded) < @tile_width
+                gem_emoji_padded += ' '
+            end
+
             $timings.profile("render: main screen") do
                 (0...@height).each do |y|
                     (0...@width).each do |x|
@@ -842,34 +871,18 @@ class Runner
                             end
                             bg = @wall_color_cache[offset]
                         end
-                        (0...@bots.size).each do |_k|
-                            i = (_k + bot_with_initiative) % @bots.size
-                            bot = @bots[i]
-                            next if bot[:disqualified_for]
-                            p = bot[:position]
-                            if p[0] == x && p[1] == y
-                                c = @bots[i][:emoji]
-                                while vwidth(c) < @tile_width
-                                    c += ' '
-                                end
-                            end
+                        if (bot_c = bot_emoji_at[offset])
+                            c = bot_c
                         end
-                        @gems.each.with_index do |p, i|
-                            if p[:position][0] == x && p[:position][1] == y
-                                c = GEM_EMOJI
-                                while vwidth(c) < @tile_width
-                                    c += ' '
-                                end
-                            end
-                            if @emit_signals
-                                if signal_level[i].include?((y << 16) | x)
-                                    unless @maze.include?((y << 16) | x) && !have_antenna
-                                        level = signal_level[i][(y << 16) | x]
-                                        # clamp signal level for rendering
-                                        level = 0.0 if level < 0.0
-                                        level = 1.0 if level > 1.0
-                                        bg = mix_rgb_hex(GEM_COLOR, bg, 1.0 - level)
-                                    end
+                        if gem_offsets[offset]
+                            c = gem_emoji_padded
+                        end
+                        if @emit_signals && signal_by_offset.key?(offset)
+                            unless @maze.include?(offset) && !have_antenna
+                                signal_by_offset[offset].each do |level|
+                                    level = 0.0 if level < 0.0
+                                    level = 1.0 if level > 1.0
+                                    bg = mix_rgb_hex(GEM_COLOR, bg, 1.0 - level)
                                 end
                             end
                         end
