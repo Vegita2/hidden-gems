@@ -900,10 +900,10 @@ class Runner
                         end
                         highlight_color = nil
                         (0...@bots.size).each do |_k|
-                            i = _k
-                            bot = @bots[i]
+                            bot = @bots[_k]
                             next if bot[:disqualified_for]
-                            if (@visibility[(bot[:position][1] << 16) | bot[:position][0]] || Set.new()).include?((y << 16) | x)
+                            vis = bots_visible[_k]
+                            if vis && vis.include?(offset)
                                 if @bots.size == 2
                                     if highlight_color.nil?
                                         highlight_color = @faded_highlight_color
