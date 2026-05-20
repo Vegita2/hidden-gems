@@ -39,6 +39,26 @@ class PCG32
     self
   end
 
+  # Advance the RNG state by delta steps in O(log delta) time
+  # without producing output. Uses the standard PCG jump-ahead formula.
+  def advance(delta)
+    delta &= MASK64
+    cur_mult = MULT
+    cur_plus = @inc
+    acc_mult = 1
+    acc_plus = 0
+    while delta > 0
+      if delta & 1 != 0
+        acc_mult = (acc_mult * cur_mult) & MASK64
+        acc_plus = (acc_plus * cur_mult + cur_plus) & MASK64
+      end
+      cur_plus = ((cur_mult + 1) * cur_plus) & MASK64
+      cur_mult = (cur_mult * cur_mult) & MASK64
+      delta >>= 1
+    end
+    @state = (acc_mult * @state + acc_plus) & MASK64
+  end
+
   def next_uint32
     oldstate = @state
     @state   = (oldstate * MULT + @inc) & MASK64

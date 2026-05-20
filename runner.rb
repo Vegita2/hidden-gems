@@ -1148,6 +1148,10 @@ class Runner
                 wavefront = new_wavefront
             end
             gem[:level] = level
+            idx = 0
+            key_index = {}
+            level.each_key { |k| key_index[k] = idx; idx += 1 }
+            gem[:level_key_index] = key_index
         end
 
         @gems_spawned += 1
@@ -1353,11 +1357,11 @@ class Runner
 
                     # STEP 1: Calculate signal levels at each tile
                     if @emit_signals
+                        bot_vis_keys = @bots.map { |b| (b[:position][1] << 16) | b[:position][0] }
                         signal_level = @gems.map do |gem|
-                            # fade first
-                            temp = gem[:level]
+                            # compute fade factor
+                            t = 1.0
                             if @signal_fade > 0
-                                t = 1.0
                                 gem_age = @gem_ttl - gem[:ttl]
                                 if gem_age < @signal_fade
                                     t = (gem_age + 1).to_f / @signal_fade
@@ -1366,25 +1370,77 @@ class Runner
                                 end
                                 t = 0.0 if t < 0.0
                                 t = 1.0 if t > 1.0
-                                if t < 1.0
-                                    temp = temp.transform_values { |x| x * t }
-                                end
                             end
-                            # add noise after fading
+
+                            # lightweight path — skip-ahead RNG, only compute bot positions
                             if @signal_noise > 0.0
-                                temp = temp.transform_values do |l|
-                                    if @stage_key < 'stage-3@0.2'
-                                        l += (@rng.next_float() - 0.5) * 2.0 * @signal_noise
-                                    else
-                                        l += @rng.rand_normal(0, @signal_noise * 0.577350)
+                                n = gem[:level].size
+                                result = {}
+                                if @stage_key < 'stage-3@0.2'
+                                    # next_float path: 1 uint32 per tile
+                                    bot_vis_keys.each do |bk|
+                                        idx = gem[:level_key_index][bk]
+                                        next unless idx
+                                        tmp = @rng.dup
+                                        tmp.advance(idx)
+                                        noise = (tmp.next_float() - 0.5) * 2.0 * @signal_noise
+                                        result[bk] = (gem[:level][bk] * t) + noise
                                     end
-                                    # no clamping of raw noisy signals, we'll only clamp for rendering later
-                                    # l = 0.0 if l < 0.0
-                                    # l = 1.0 if l > 1.0
-                                    l
+                                    @rng.advance(n)
+                                else
+                                    # rand_normal path: pairs of uint32 via Box-Muller with spare
+                                    spare_set = !@rng.instance_variable_get(:@normal_spare).nil?
+                                    existing_spare = @rng.instance_variable_get(:@normal_spare)
+                                    stddev = @signal_noise * 0.577350
+                                    bot_vis_keys.each do |bk|
+                                        idx = gem[:level_key_index][bk]
+                                        next unless idx
+                                        if spare_set && idx == 0
+                                            noise = existing_spare * stddev
+                                        else
+                                            eff = spare_set ? idx - 1 : idx
+                                            pair_uint32 = (eff / 2) * 2
+                                            tmp = @rng.dup
+                                            tmp.advance(pair_uint32)
+                                            u1 = 1.0 - tmp.next_float
+                                            u2 = tmp.next_float
+                                            r = Math.sqrt(-2.0 * Math.log(u1))
+                                            theta = 2.0 * Math::PI * u2
+                                            z = eff.even? ? r * Math.cos(theta) : r * Math.sin(theta)
+                                            noise = z * stddev
+                                        end
+                                        result[bk] = (gem[:level][bk] * t) + noise
+                                    end
+                                    # advance RNG and set spare to match sequential execution
+                                    fresh = spare_set ? n - 1 : n
+                                    uint32_calls = ((fresh + 1) / 2) * 2
+                                    if fresh.odd?
+                                        # spare is set: compute z1 of last pair from pre-advance state
+                                        last_pair_uint32 = fresh - 1
+                                        tmp = @rng.dup
+                                        tmp.advance(last_pair_uint32)
+                                        u1 = 1.0 - tmp.next_float
+                                        u2 = tmp.next_float
+                                        r = Math.sqrt(-2.0 * Math.log(u1))
+                                        theta = 2.0 * Math::PI * u2
+                                        @rng.advance(uint32_calls)
+                                        @rng.instance_variable_set(:@normal_spare, r * Math.sin(theta))
+                                    else
+                                        @rng.advance(uint32_calls)
+                                        @rng.instance_variable_set(:@normal_spare, nil)
+                                    end
+                                end
+                                result
+                            else
+                                # no noise, no RNG to advance
+                                if t < 1.0
+                                    result = {}
+                                    bot_vis_keys.each { |k| v = gem[:level][k]; result[k] = v * t if v }
+                                    result
+                                else
+                                    gem[:level]
                                 end
                             end
-                            temp
                         end
                     end
 
